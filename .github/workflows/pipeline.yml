@@ -1,0 +1,359 @@
+# =============================================================================
+# CI/CD Pipeline: Build → Test → Scan → Push → Deploy (Dev) → Approve → Deploy (Prod)
+# =============================================================================
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: cicd-demo-api
+  ECS_CLUSTER_DEV: demo-cluster-dev
+  ECS_CLUSTER_PROD: demo-cluster-prod
+  ECS_SERVICE_DEV: demo-service-dev
+  ECS_SERVICE_PROD: demo-service-prod
+  ECS_TASK_DEF_DEV: infra/task-def-dev.json
+  ECS_TASK_DEF_PROD: infra/task-def-prod.json
+  CONTAINER_NAME: demo-api
+
+# Only one pipeline per branch at a time
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # 1. BUILD & TEST
+  # ===========================================================================
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write    # for test report annotations
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: false
+
+      - name: Run tests with coverage
+        run: npm run test:ci
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: reports/junit.xml
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+  # ===========================================================================
+  # 2. CODE QUALITY GATE (SonarQube)
+  # ===========================================================================
+  code-quality:
+    name: Code Quality (SonarQube)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for accurate analysis
+
+      - name: Download coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: reports/
+
+      - name: Verify SonarQube connectivity
+        run: |
+          echo "Testing connection to SonarQube..."
+          curl -sf --max-time 10 "${{ secrets.SONAR_HOST_URL }}/api/system/status" || {
+            echo "::error::Cannot reach SonarQube at ${{ secrets.SONAR_HOST_URL }}"
+            exit 1
+          }
+          echo "SonarQube is reachable."
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # ===========================================================================
+  # 3. BUILD & PUSH DOCKER IMAGE
+  # ===========================================================================
+  docker-build-push:
+    name: Build & Push Docker Image
+    needs: [build-and-test, code-quality]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_uri: ${{ steps.build.outputs.image_uri }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          SHA_SHORT=$(echo "${{ github.sha }}" | head -c 7)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          VERSION="${TIMESTAMP}-${SHA_SHORT}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          
+          docker build \
+            --build-arg APP_VERSION="${IMAGE_TAG}" \
+            --build-arg BUILD_SHA="${{ github.sha }}" \
+            -t "${IMAGE_URI}" \
+            -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
+            .
+          
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # 3a. VULNERABILITY SCAN (Trivy)
+      # -----------------------------------------------------------------
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image_uri }}
+          format: table
+          exit-code: 1                 # fail on HIGH/CRITICAL
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Trivy SARIF report (for GitHub Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image_uri }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+        run: |
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+
+  # ===========================================================================
+  # 4. DEPLOY TO DEV (automatic)
+  # ===========================================================================
+  deploy-dev:
+    name: Deploy → Dev
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    environment:
+      name: dev
+      url: https://dev-api.example.com/health
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEF_DEV }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: "${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.docker-build-push.outputs.image_tag }}"
+
+      - name: Deploy to ECS (Dev)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_DEV }}
+          cluster: ${{ env.ECS_CLUSTER_DEV }}
+          wait-for-service-stability: true
+          wait-for-minutes: 5
+
+      - name: Smoke test Dev
+        run: |
+          sleep 15
+          HEALTH=$(curl -sf https://dev-api.example.com/health || echo "FAILED")
+          echo "Health check response: ${HEALTH}"
+          echo "${HEALTH}" | grep -q '"status":"healthy"' || {
+            echo "::error::Dev smoke test failed"
+            exit 1
+          }
+
+      - name: Notify Slack — Dev deployed
+        if: success()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "✅ *Dev Deploy Succeeded*\nImage: `${{ needs.docker-build-push.outputs.image_tag }}`\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}"
+            }
+
+      - name: Notify Slack — Dev failed
+        if: failure()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "❌ *Dev Deploy Failed*\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}\nWorkflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+  # ===========================================================================
+  # 5. DEPLOY TO PRODUCTION (manual approval required)
+  # ===========================================================================
+  deploy-production:
+    name: Deploy → Production
+    needs: [docker-build-push, deploy-dev]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production         # ← GitHub Environment with required reviewers
+      url: https://api.example.com/health
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEF_PROD }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: "${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.docker-build-push.outputs.image_tag }}"
+
+      - name: Deploy to ECS (Production)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_PROD }}
+          cluster: ${{ env.ECS_CLUSTER_PROD }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Smoke test Production
+        run: |
+          sleep 15
+          HEALTH=$(curl -sf https://api.example.com/health || echo "FAILED")
+          echo "Health check response: ${HEALTH}"
+          echo "${HEALTH}" | grep -q '"status":"healthy"' || {
+            echo "::error::Production smoke test failed"
+            exit 1
+          }
+
+      - name: Notify Slack — Production deployed
+        if: success()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "🚀 *Production Deploy Succeeded*\nImage: `${{ needs.docker-build-push.outputs.image_tag }}`\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}"
+            }
+
+      - name: Notify Slack — Production failed
+        if: failure()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "🔥 *PRODUCTION DEPLOY FAILED*\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}\nWorkflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }

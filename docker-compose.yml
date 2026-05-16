@@ -1,0 +1,44 @@
+# docker-compose.yml — Local development & testing
+# Usage:
+#   docker compose up              → run the API
+#   docker compose up sonarqube    → run SonarQube locally
+#   docker compose --profile scan up → run Trivy scan
+
+services:
+  api:
+    build:
+      context: .
+      target: production
+      args:
+        APP_VERSION: local-dev
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - LOG_LEVEL=debug
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # SonarQube for local quality analysis
+  sonarqube:
+    image: sonarqube:community
+    ports:
+      - "9000:9000"
+    environment:
+      - SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+
+  # Trivy for local vulnerability scanning
+  trivy:
+    image: aquasec/trivy:latest
+    profiles: ["scan"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: image cicd-pipeline-api:latest
+
+volumes:
+  sonar_data:
