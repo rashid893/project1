@@ -1,7 +1,7 @@
 # ============================================
 # Stage 1: Install dependencies
 # ============================================
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --only=production && \
@@ -11,7 +11,7 @@ RUN npm ci --only=production && \
 # ============================================
 # Stage 2: Run tests (CI layer — not in final image)
 # ============================================
-FROM node:20-alpine AS test
+FROM node:22-alpine AS test
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -20,7 +20,7 @@ RUN npm test
 # ============================================
 # Stage 3: Production image
 # ============================================
-FROM node:20-alpine AS production
+FROM node:22-alpine AS production
 
 # Security: run as non-root
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
