@@ -126,6 +126,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      security-events: write
     outputs:
       image_tag: ${{ steps.meta.outputs.version }}
       image_uri: ${{ steps.build.outputs.image_uri }}
