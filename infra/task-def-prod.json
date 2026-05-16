@@ -4,12 +4,12 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "512",
   "memory": "1024",
-  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskRole-prod",
+  "executionRoleArn": "arn:aws:iam::075647413784:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::075647413784:role/ecsTaskRole-prod",
   "containerDefinitions": [
     {
       "name": "demo-api",
-      "image": "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/cicd-demo-api:latest",
+      "image": "075647413784.dkr.ecr.us-east-1.amazonaws.com/cicd-demo-api:latest",
       "essential": true,
       "portMappings": [
         {
