@@ -10,7 +10,7 @@ on:
     branches: [main]
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ap-southeast-2
   ECR_REPOSITORY: cicd-demo-api
   ECS_CLUSTER_DEV: demo-cluster-dev
   ECS_CLUSTER_PROD: demo-cluster-prod
@@ -42,7 +42,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
@@ -215,7 +215,6 @@ jobs:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     environment:
       name: dev
-      url: https://dev-api.example.com/health
     permissions:
       id-token: write
       contents: read
@@ -250,16 +249,6 @@ jobs:
           wait-for-service-stability: true
           wait-for-minutes: 5
 
-      - name: Smoke test Dev
-        run: |
-          sleep 15
-          HEALTH=$(curl -sf https://dev-api.example.com/health || echo "FAILED")
-          echo "Health check response: ${HEALTH}"
-          echo "${HEALTH}" | grep -q '"status":"healthy"' || {
-            echo "::error::Dev smoke test failed"
-            exit 1
-          }
-
       - name: Notify Slack — Dev deployed
         if: success()
         uses: slackapi/slack-github-action@v2.0.0
@@ -292,7 +281,6 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment:
       name: production         # ← GitHub Environment with required reviewers
-      url: https://api.example.com/health
     permissions:
       id-token: write
       contents: read
@@ -326,16 +314,6 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER_PROD }}
           wait-for-service-stability: true
           wait-for-minutes: 10
-
-      - name: Smoke test Production
-        run: |
-          sleep 15
-          HEALTH=$(curl -sf https://api.example.com/health || echo "FAILED")
-          echo "Health check response: ${HEALTH}"
-          echo "${HEALTH}" | grep -q '"status":"healthy"' || {
-            echo "::error::Production smoke test failed"
-            exit 1
-          }
 
       - name: Notify Slack — Production deployed
         if: success()

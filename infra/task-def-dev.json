@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "demo-api",
-      "image": "075647413784.dkr.ecr.us-east-1.amazonaws.com/cicd-demo-api:latest",
+      "image": "075647413784.dkr.ecr.ap-southeast-2.amazonaws.com/cicd-demo-api:latest",
       "essential": true,
       "portMappings": [
         {
@@ -25,7 +25,7 @@
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/demo-api-dev",
-          "awslogs-region": "us-east-1",
+          "awslogs-region": "ap-southeast-2",
           "awslogs-stream-prefix": "ecs"
         }
       },
